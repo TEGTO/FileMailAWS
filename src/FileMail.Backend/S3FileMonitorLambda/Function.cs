@@ -1,16 +1,15 @@
-using Amazon.Lambda.Core;
+﻿using Amazon.Lambda.Core;
 using Amazon.Lambda.S3Events;
+using Amazon.Lambda.Serialization.SystemTextJson;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Amazon.SimpleEmail;
 using Amazon.SimpleEmail.Model;
 using System.Text;
 
-// Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
-[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+[assembly: LambdaSerializer(typeof(DefaultLambdaJsonSerializer))]
 
 namespace S3FileMonitorLambda;
-
 public class Function
 {
     private readonly IAmazonS3 s3Client;
@@ -46,10 +45,18 @@ public class Function
                     continue;
                 }
 
-                var recipientEmail = response.Metadata["x-amz-meta-email"];
+                string DecodeBase64(string encodedValue) =>
+                    Encoding.UTF8.GetString(Convert.FromBase64String(encodedValue));
+
+                var encodedEmail = response.Metadata["x-amz-meta-email"];
+                var recipientEmail = DecodeBase64(encodedEmail);
+
                 context.Logger.LogInformation($"Sending file {objectKey} to {recipientEmail}");
 
-                await SendEmailWithAttachmentAsync(recipientEmail, objectKey, response.ResponseStream);
+                var encodedFileNameWithExtension = response.Metadata["x-amz-meta-originalname"];
+                var fileNameWithExtension = DecodeBase64(encodedFileNameWithExtension);
+
+                await SendEmailWithAttachmentAsync(recipientEmail, fileNameWithExtension, response.ResponseStream);
             }
             catch (Exception ex)
             {

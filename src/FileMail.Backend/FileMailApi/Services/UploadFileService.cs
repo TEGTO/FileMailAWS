@@ -1,5 +1,6 @@
 ﻿using Amazon.S3;
 using Amazon.S3.Model;
+using System.Text;
 
 namespace FileMailApi.Services
 {
@@ -18,6 +19,9 @@ namespace FileMailApi.Services
         {
             using var stream = file.OpenReadStream();
 
+            string EncodeToBase64(string value) =>
+                Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+
             var request = new PutObjectRequest
             {
                 BucketName = bucketName,
@@ -26,9 +30,9 @@ namespace FileMailApi.Services
                 InputStream = stream,
                 Metadata =
                 {
-                    [ "x-amz-meta-originalname"] = file.FileName,
-                    [ "x-amz-meta-extension"] = Path.GetExtension(file.FileName),
-                    [ "x-amz-meta-email"] = email,
+                    ["x-amz-meta-originalname"] = EncodeToBase64(file.FileName),
+                    ["x-amz-meta-extension"] = EncodeToBase64(Path.GetExtension(file.FileName)),
+                    ["x-amz-meta-email"] = EncodeToBase64(email),
                 },
             };
 
