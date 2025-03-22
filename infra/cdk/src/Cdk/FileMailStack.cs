@@ -7,6 +7,7 @@ using Amazon.CDK.AWS.IAM;
 using Amazon.CDK.AWS.Lambda;
 using Amazon.CDK.AWS.S3;
 using Amazon.CDK.AWS.S3.Notifications;
+using Amazon.CDK.AWS.ServiceDiscovery;
 using Constructs;
 using System.Collections.Generic;
 using System.IO;
@@ -17,23 +18,40 @@ namespace Cdk
     {
         internal FileMailStack(Construct scope, string id, IStackProps props = null) : base(scope, id, props)
         {
-            var sourceDir = Path.Combine(Directory.GetCurrentDirectory(), "../../src/FileMail.Backend");
-            var targetDir = Path.Combine(Directory.GetCurrentDirectory(), "FileMail.Backend");
-
-            if (Directory.Exists(targetDir))
-            {
-                Directory.Delete(targetDir, true);
-            }
-            CopyDirectory(sourceDir, targetDir);
-
             var vpc = new Amazon.CDK.AWS.EC2.Vpc(this, "MyVpc", new Amazon.CDK.AWS.EC2.VpcProps
             {
                 MaxAzs = 2
             });
 
+            var cluster = new Cluster(this, "FileMailApiCluster", new ClusterProps
+            {
+                Vpc = vpc,
+                DefaultCloudMapNamespace = new CloudMapNamespaceOptions
+                {
+                    Name = "filemail",
+                    Type = NamespaceType.DNS_PRIVATE,
+                    Vpc = vpc
+                }
+            });
+
+            #region [Backend]
+
+            var backendDir = Path.Combine(Directory.GetCurrentDirectory(), "../../src/FileMail.Backend");
+            var lambdaDir = $"{backendDir}/S3FileMonitorLambda";
+
             var fileUploadBucket = AddBucket();
-            AddApi(vpc, targetDir, fileUploadBucket);
-            AddLambda(fileUploadBucket);
+            AddApi(cluster, backendDir, fileUploadBucket);
+            AddLambda(fileUploadBucket, lambdaDir);
+
+            #endregion
+
+            #region [Frontend]
+
+            var frontendDir = Path.Combine(Directory.GetCurrentDirectory(), "../../src/FileMail.Frontend");
+
+            AddFrontend(cluster, frontendDir);
+
+            #endregion
         }
 
         private Bucket AddBucket()
@@ -46,12 +64,9 @@ namespace Cdk
             });
         }
 
-        private void AddApi(Vpc vpc, string targetDir, IBucket fileUploadBucket)
+        private void AddApi(Cluster cluster, string targetDir, IBucket fileUploadBucket)
         {
-            var cluster = new Cluster(this, "FileMailApiCluster", new ClusterProps
-            {
-                Vpc = vpc,
-            });
+            var serviceName = "api";
 
             var dockerImage = new DockerImageAsset(this, "FileMailApiImage", new DockerImageAssetProps
             {
@@ -74,12 +89,21 @@ namespace Cdk
                     Environment = new Dictionary<string, string>
                     {
                         { "ASPNETCORE_ENVIRONMENT", "Development" },
-                        { "BUCKET_NAME", fileUploadBucket.BucketName }
+                        { "BUCKET_NAME", fileUploadBucket.BucketName },
+                        { "UseCORS", "true" },
+                        { "AllowedCORSOrigins", "" },
                     },
                     LogDriver = LogDriver.AwsLogs(new AwsLogDriverProps
                     {
                         StreamPrefix = "FileMailApiApp"
                     })
+                },
+                ServiceName = serviceName,
+                CloudMapOptions = new CloudMapOptions
+                {
+                    Name = serviceName,
+                    DnsRecordType = DnsRecordType.A,
+                    DnsTtl = Duration.Seconds(60)
                 },
                 MemoryLimitMiB = 1024,
                 Cpu = 512,
@@ -90,7 +114,7 @@ namespace Cdk
 
             fileUploadBucket.GrantPut(fargateService.TaskDefinition.TaskRole);
 
-            var cfnService = fargateService.Service.Node.DefaultChild as CfnService;
+            var cfnService = fargateService.Service.Node.DefaultChild as Amazon.CDK.AWS.ECS.CfnService;
             if (cfnService != null)
             {
                 cfnService.AddPropertyOverride("NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp", "ENABLED");
@@ -121,7 +145,7 @@ namespace Cdk
             );
         }
 
-        private void AddLambda(Bucket fileUploadBucket)
+        private void AddLambda(Bucket fileUploadBucket, string targetDir)
         {
             var lambdaRole = new Role(this, "LambdaExecutionRole", new RoleProps
             {
@@ -153,7 +177,7 @@ namespace Cdk
                 Runtime = Runtime.DOTNET_8,
                 MemorySize = 1024,
                 Handler = "S3FileMonitorLambda::S3FileMonitorLambda.Function::FunctionHandler",
-                Code = Code.FromAsset("FileMail.Backend/S3FileMonitorLambda", new Amazon.CDK.AWS.S3.Assets.AssetOptions
+                Code = Code.FromAsset(targetDir, new Amazon.CDK.AWS.S3.Assets.AssetOptions
                 {
                     Bundling = buildOption
                 }),
@@ -170,17 +194,62 @@ namespace Cdk
             fileUploadBucket.AddEventNotification(EventType.OBJECT_CREATED, new LambdaDestination(lambdaFunction));
         }
 
-        private static void CopyDirectory(string sourceDir, string targetDir)
+        private void AddFrontend(Cluster cluster, string targetDir)
         {
-            Directory.CreateDirectory(targetDir);
-            foreach (var file in Directory.GetFiles(sourceDir))
+            var dockerImage = new DockerImageAsset(this, "FileMailFrontendImage", new DockerImageAssetProps
             {
-                File.Copy(file, Path.Combine(targetDir, Path.GetFileName(file)), true);
-            }
-            foreach (var dir in Directory.GetDirectories(sourceDir))
+                Directory = targetDir,
+                File = "Dockerfile",
+                BuildArgs = new Dictionary<string, string>
+                {
+                    { "ENV", "production" }
+                },
+                Invalidation = new DockerImageAssetInvalidationOptions
+                {
+                    BuildArgs = false,
+                },
+            });
+
+            var fargateService = new ApplicationLoadBalancedFargateService(this, $"FrontendService", new ApplicationLoadBalancedFargateServiceProps
             {
-                CopyDirectory(dir, Path.Combine(targetDir, Path.GetFileName(dir)));
+                Cluster = cluster,
+                DesiredCount = 1,
+                TaskImageOptions = new ApplicationLoadBalancedTaskImageOptions
+                {
+                    Image = ContainerImage.FromDockerImageAsset(dockerImage),
+                    ContainerPort = 80,
+                    LogDriver = LogDriver.AwsLogs(new AwsLogDriverProps
+                    {
+                        StreamPrefix = $"FrontendServiceLogs"
+                    }),
+                },
+                MemoryLimitMiB = 1024,
+                Cpu = 512,
+                AssignPublicIp = true,
+                PublicLoadBalancer = true,
+                TaskSubnets = new SubnetSelection { SubnetType = SubnetType.PUBLIC },
+            });
+
+            var cfnService = fargateService.Service.Node.DefaultChild as Amazon.CDK.AWS.ECS.CfnService;
+            if (cfnService != null)
+            {
+                cfnService.AddPropertyOverride("NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp", "ENABLED");
             }
+
+            fargateService.TaskDefinition.TaskRole.AddManagedPolicy(
+                ManagedPolicy.FromAwsManagedPolicyName("AmazonEC2ContainerRegistryReadOnly"));
+
+            fargateService.Service.Connections.SecurityGroups[0].AddIngressRule(
+                Peer.AnyIpv4(),
+                Port.Tcp(80),
+                "Allow public HTTP access over IPv4"
+            );
+
+            fargateService.Service.Connections.SecurityGroups[0].AddIngressRule(
+                Peer.AnyIpv6(),
+                Port.Tcp(80),
+                "Allow public HTTP access over IPv6"
+            );
         }
     }
 }

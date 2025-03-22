@@ -1,4 +1,5 @@
 using Amazon.S3;
+using FileMailApi;
 using FileMailApi.Services;
 using FluentValidation;
 using FluentValidation.AspNetCore;
@@ -12,13 +13,24 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddFluentValidationAutoValidation();
 builder.Services.AddFluentValidationClientsideAdapters();
 builder.Services.AddValidatorsFromAssemblyContaining(typeof(Program));
+ValidatorOptions.Global.LanguageManager.Enabled = false;
 
 var s3Client = new AmazonS3Client();
 builder.Services.AddSingleton<IAmazonS3>(s3Client);
 
 builder.Services.AddSingleton<IUploadFileService, UploadFileService>();
 
-ValidatorOptions.Global.LanguageManager.Enabled = false;
+#region Cors
+
+bool.TryParse(builder.Configuration[ConfigurationVariableKeys.UseCORS], out bool useCORS);
+var myAllowSpecificOrigins = "_myAllowSpecificOrigins";
+
+if (useCORS)
+{
+    builder.Services.AddApplicationCORS(builder.Configuration, myAllowSpecificOrigins, builder.Environment.IsDevelopment());
+}
+
+#endregion
 
 builder.Services.AddHealthChecks();
 
@@ -32,6 +44,7 @@ if (app.Environment.IsDevelopment())
 
 app.MapHealthChecks("/health");
 
+app.UseCors(myAllowSpecificOrigins);
 app.UseHttpsRedirection();
 
 app.UseAuthorization();
